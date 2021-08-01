@@ -3,7 +3,7 @@
 
 //! # mysql-stream
 //!
-//! futures-code::Stream adapter for mysql_async
+//! futures-core::Stream adapter for mysql_async
 
 use std::{
     marker::PhantomData,
@@ -171,7 +171,7 @@ where
                 .and_then(|row| from_row_opt::<T>(row.unwrap()).map_err(StreamError::from));
 
             // TryCollect workaround
-            // Why this is needed? Because TryCollect stops at first error encountered, so we'll never reach None and never drop_result
+            // Why is this needed? Because TryCollect stops at first error encountered, so we'll never reach None and never drop_result
             if res.is_err() {
                 if let CowMut::Owned(qr) = query_result {
                     if let Err(e) = res {
