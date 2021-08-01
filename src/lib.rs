@@ -61,19 +61,19 @@ pub fn stream_and_drop<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unp
 }
 
 pub struct Stream<'q, 'a, 't, P, T> {
-    state: StreamState<'q, 'a, 't, P>,
+    state: StreamState<'q, 'a, 't, P, T>,
     _marker: PhantomData<T>,
 }
 
-enum StreamState<'q, 'a, 't, P> {
+enum StreamState<'q, 'a, 't, P, T> {
     QueryResult(CowMut<'q, 'a, 't, P>),
     NextFut(BoxFuture<'q, (NextResult, CowMut<'q, 'a, 't, P>)>),
-    DropFut(BoxFuture<'q, Result<(), StreamError>>),
+    DropFut(BoxFuture<'q, Result<Option<T>, StreamError>>),
     Done,
     Invalid,
 }
 
-impl<'q, 'a, 't, P> StreamState<'q, 'a, 't, P> {
+impl<'q, 'a, 't, P, T> StreamState<'q, 'a, 't, P, T> {
     fn take(&mut self) -> Self {
         match std::mem::replace(self, Self::Invalid) {
             Self::Invalid => panic!("Stream state is invalid"),
@@ -123,7 +123,7 @@ impl<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unpin> futures_util::
 
 fn handle_next<'q, 'a: 'q, 't: 'a, P: Protocol, T>(
     mut fut: BoxFuture<'q, (NextResult, CowMut<'q, 'a, 't, P>)>,
-    state: &mut StreamState<'q, 'a, 't, P>,
+    state: &mut StreamState<'q, 'a, 't, P, T>,
     cx: &mut Context,
 ) -> Poll<Option<Result<T, StreamError>>>
 where
@@ -137,39 +137,60 @@ where
         }
     };
     Poll::Ready(match next_result {
-        Ok(Some(row)) => {
-            *state = StreamState::QueryResult(query_result);
-            Some(from_row_opt(row).map_err(StreamError::from))
-        }
         Ok(None) => {
             if let CowMut::Owned(qr) = query_result {
                 *state = StreamState::DropFut(Box::pin(async move {
-                    qr.drop_result().await.map_err(StreamError::from)
+                    #[cfg(test)]
+                    eprintln!("Dropping on end");
+
+                    qr.drop_result().await?;
+                    Ok(None)
                 }));
+                return Poll::Pending;
             }
-            else {
-                *state = StreamState::Done;
-            }
+
+            *state = StreamState::Done;
             None
-        }
-        Err(e) => {
+        },
+        res => {
+            let res = res.map_err(StreamError::from)
+                .and_then(|row| from_row_opt::<T>(row.unwrap()).map_err(StreamError::from));
+
+            // TryStream workaround
+            if res.is_err() {
+                if let CowMut::Owned(qr) = query_result {
+                    if let Err(e) = res {
+                        *state = StreamState::DropFut(Box::pin(async move {
+                            #[cfg(test)]
+                            eprintln!("Dropping on error");
+
+                            qr.drop_result().await?;
+                            Err(e)
+                        }));
+                        return Poll::Pending;
+                    }
+                    else {
+                        unreachable!();
+                    }
+                }
+            }
+
             *state = StreamState::QueryResult(query_result);
-            Some(Err(StreamError::from(e)))
+            Some(res)
         }
     })
 }
 
 fn handle_drop<'q, 'a: 'q, 't: 'a, P: Protocol, T>(
-    mut fut: BoxFuture<'q, Result<(), StreamError>>,
-    state: &mut StreamState<'q, 'a, 't, P>,
+    mut fut: BoxFuture<'q, Result<Option<T>, StreamError>>,
+    state: &mut StreamState<'q, 'a, 't, P, T>,
     cx: &mut Context,
 ) -> Poll<Option<Result<T, StreamError>>>
 where
     T: FromRow,
 {
     match fut.as_mut().poll(cx) {
-        Poll::Ready(Ok(())) => Poll::Ready(None),
-        Poll::Ready(Err(e)) => Poll::Ready(Some(Err(StreamError::from(e)))),
+        Poll::Ready(r) => Poll::Ready(r.transpose()),
         Poll::Pending => {
             *state = StreamState::DropFut(fut);
             Poll::Pending
@@ -216,6 +237,20 @@ mod test {
     }
 
     #[tokio::test]
+    async fn stream_err() {
+        let url = env::var("DATABASE_URL").expect("Missing DATABASE_URL env var");
+        let mut conn = Conn::from_url(url)
+            .await
+            .expect("Connection failed");
+        let mut qr = conn.query_iter("SELECT 'abc'")
+            .await
+            .expect("Query failed");
+        let res = super::stream::<_, Foo>(&mut qr).try_collect::<Vec<_>>().await;
+        qr.drop_result().await.expect("Drop failed");
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
     async fn stream_and_drop() {
         let url = env::var("DATABASE_URL").expect("Missing DATABASE_URL env var");
         let mut conn = Conn::from_url(url)
@@ -227,5 +262,18 @@ mod test {
         let res: Vec<Foo> = super::stream_and_drop(qr).try_collect().await.expect("Collect failed");
         assert!(res.len() == 1);
         println!("{}", res[0].timestamp);
+    }
+
+    #[tokio::test]
+    async fn stream_and_drop_err() {
+        let url = env::var("DATABASE_URL").expect("Missing DATABASE_URL env var");
+        let mut conn = Conn::from_url(url)
+            .await
+            .expect("Connection failed");
+        let qr = conn.query_iter("SELECT 'abc'")
+            .await
+            .expect("Query failed");
+        let res = super::stream_and_drop::<_, Foo>(qr).try_collect::<Vec<_>>().await;
+        assert!(res.is_err());
     }
 }
