@@ -1,3 +1,10 @@
+#![deny(warnings)]
+#![deny(missing_docs)]
+
+//! # mysql-stream
+//!
+//! futures-code::Stream adapter for mysql_async
+
 use std::{
     marker::PhantomData,
     pin::Pin,
@@ -5,15 +12,19 @@ use std::{
 };
 
 use futures_util::future::BoxFuture;
+
 use mysql_async::{
     from_row_opt,
     prelude::{FromRow, Protocol},
     FromRowError, QueryResult, Row,
 };
 
+/// Facility to have a single error type
 #[derive(Debug)]
 pub enum StreamError {
+    /// Row conversion error (e.g. type conversion error)
     Row(FromRowError),
+    /// General error (e.g. network error)
     General(mysql_async::Error),
 }
 
@@ -40,6 +51,7 @@ impl From<mysql_async::Error> for StreamError {
     }
 }
 
+/// Transforms a mysql_async::QueryResult into a futures-core::Stream, mutable reference version
 pub fn stream<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unpin>(
     inner: &'q mut QueryResult<'a, 't, P>,
 ) -> Stream<'q, 'a, 't, P, T> {
@@ -50,6 +62,7 @@ pub fn stream<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unpin>(
     }
 }
 
+/// Transforms a mysql_async::QueryResult into a futures-core::Stream, owned version
 pub fn stream_and_drop<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unpin>(
     inner: QueryResult<'a, 't, P>,
 ) -> Stream<'q, 'a, 't, P, T> {
@@ -60,6 +73,7 @@ pub fn stream_and_drop<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unp
     }
 }
 
+/// Intermediate type to implement futures-core::Stream for mysql_async::QueryResult
 pub struct Stream<'q, 'a, 't, P, T> {
     state: StreamState<'q, 'a, 't, P, T>,
     _marker: PhantomData<T>,
@@ -156,7 +170,8 @@ where
             let res = res.map_err(StreamError::from)
                 .and_then(|row| from_row_opt::<T>(row.unwrap()).map_err(StreamError::from));
 
-            // TryStream workaround
+            // TryCollect workaround
+            // Why this is needed? Because TryCollect stops at first error encountered, so we'll never reach None and never drop_result
             if res.is_err() {
                 if let CowMut::Owned(qr) = query_result {
                     if let Err(e) = res {
