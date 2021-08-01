@@ -12,31 +12,31 @@ use mysql_async::{
 };
 
 #[derive(Debug)]
-pub enum StreamErr {
+pub enum StreamError {
     Row(FromRowError),
     General(mysql_async::Error),
 }
 
-impl std::fmt::Display for StreamErr {
+impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StreamErr::Row(r) => r.fmt(f),
-            StreamErr::General(g) => g.fmt(f),
+            StreamError::Row(r) => r.fmt(f),
+            StreamError::General(g) => g.fmt(f),
         }
     }
 }
 
-impl std::error::Error for StreamErr {}
+impl std::error::Error for StreamError {}
 
-impl From<FromRowError> for StreamErr {
+impl From<FromRowError> for StreamError {
     fn from(e: FromRowError) -> Self {
-        StreamErr::Row(e)
+        StreamError::Row(e)
     }
 }
 
-impl From<mysql_async::Error> for StreamErr {
+impl From<mysql_async::Error> for StreamError {
     fn from(e: mysql_async::Error) -> Self {
-        StreamErr::General(e)
+        StreamError::General(e)
     }
 }
 
@@ -61,21 +61,19 @@ pub fn stream_and_drop<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unp
 }
 
 pub struct Stream<'q, 'a, 't, P, T> {
-    state: StreamState<
-        CowMut<'q, 'a, 't, P>,
-        BoxFuture<'q, (NextResult, CowMut<'q, 'a, 't, P>)>,
-    >,
+    state: StreamState<'q, 'a, 't, P>,
     _marker: PhantomData<T>,
 }
 
-enum StreamState<QR, F> {
-    QueryResult(QR),
-    Fut(F),
+enum StreamState<'q, 'a, 't, P> {
+    QueryResult(CowMut<'q, 'a, 't, P>),
+    NextFut(BoxFuture<'q, (NextResult, CowMut<'q, 'a, 't, P>)>),
+    DropFut(BoxFuture<'q, Result<(), StreamError>>),
     Done,
     Invalid,
 }
 
-impl<QR, F> StreamState<QR, F> {
+impl<'q, 'a, 't, P> StreamState<'q, 'a, 't, P> {
     fn take(&mut self) -> Self {
         match std::mem::replace(self, Self::Invalid) {
             Self::Invalid => panic!("Stream state is invalid"),
@@ -103,7 +101,7 @@ impl<'q, 'a: 'q, 't: 'a, P> AsMut<QueryResult<'a, 't, P>> for CowMut<'q, 'a, 't,
 impl<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unpin> futures_util::Stream
     for Stream<'q, 'a, 't, P, T>
 {
-    type Item = Result<T, StreamErr>;
+    type Item = Result<T, StreamError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let state = &mut self.get_mut().state;
         match state.take() {
@@ -113,47 +111,70 @@ impl<'q, 'a: 'q, 't: 'a, P: Protocol + Unpin, T: FromRow + Unpin> futures_util::
                     (row, query_result)
                 });
 
-                handle_future(fut, state, cx)
+                handle_next(fut, state, cx)
             }
-            StreamState::Fut(fut) => handle_future(fut, state, cx),
+            StreamState::NextFut(fut) => handle_next(fut, state, cx),
+            StreamState::DropFut(fut) => handle_drop(fut, state, cx),
             StreamState::Done => Poll::Ready(None),
             StreamState::Invalid => unreachable!(),
         }
     }
 }
 
-fn handle_future<'q, 'a: 'q, 't: 'a, P, T>(
+fn handle_next<'q, 'a: 'q, 't: 'a, P: Protocol, T>(
     mut fut: BoxFuture<'q, (NextResult, CowMut<'q, 'a, 't, P>)>,
-    state: &mut StreamState<
-        CowMut<'q, 'a, 't, P>,
-        BoxFuture<'q, (NextResult, CowMut<'q, 'a, 't, P>)>,
-    >,
+    state: &mut StreamState<'q, 'a, 't, P>,
     cx: &mut Context,
-) -> Poll<Option<Result<T, StreamErr>>>
+) -> Poll<Option<Result<T, StreamError>>>
 where
     T: FromRow,
 {
     let (next_result, query_result) = match fut.as_mut().poll(cx) {
         Poll::Ready(ready) => ready,
         Poll::Pending => {
-            *state = StreamState::Fut(fut);
+            *state = StreamState::NextFut(fut);
             return Poll::Pending;
         }
     };
     Poll::Ready(match next_result {
         Ok(Some(row)) => {
             *state = StreamState::QueryResult(query_result);
-            Some(from_row_opt(row).map_err(StreamErr::from))
+            Some(from_row_opt(row).map_err(StreamError::from))
         }
         Ok(None) => {
-            *state = StreamState::Done;
+            if let CowMut::Owned(qr) = query_result {
+                *state = StreamState::DropFut(Box::pin(async move {
+                    qr.drop_result().await.map_err(StreamError::from)
+                }));
+            }
+            else {
+                *state = StreamState::Done;
+            }
             None
         }
         Err(e) => {
             *state = StreamState::QueryResult(query_result);
-            Some(Err(StreamErr::from(e)))
+            Some(Err(StreamError::from(e)))
         }
     })
+}
+
+fn handle_drop<'q, 'a: 'q, 't: 'a, P: Protocol, T>(
+    mut fut: BoxFuture<'q, Result<(), StreamError>>,
+    state: &mut StreamState<'q, 'a, 't, P>,
+    cx: &mut Context,
+) -> Poll<Option<Result<T, StreamError>>>
+where
+    T: FromRow,
+{
+    match fut.as_mut().poll(cx) {
+        Poll::Ready(Ok(())) => Poll::Ready(None),
+        Poll::Ready(Err(e)) => Poll::Ready(Some(Err(StreamError::from(e)))),
+        Poll::Pending => {
+            *state = StreamState::DropFut(fut);
+            Poll::Pending
+        }
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +210,7 @@ mod test {
             .await
             .expect("Query failed");
         let res: Vec<Foo> = super::stream(&mut qr).try_collect().await.expect("Collect failed");
+        qr.drop_result().await.expect("Drop failed");
         assert!(res.len() == 1);
         println!("{}", res[0].timestamp);
     }
